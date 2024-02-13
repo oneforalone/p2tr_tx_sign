@@ -9,6 +9,6 @@ edition = "2021"
 bincode = "1.3.3"
 bip32 = "0.5.1"
 bip39 = "2.0.0"
-bitcoin = { version = "0.31.1", features = ["serde", "rand"] }
+bitcoin = { version = "0.31.1", features = ["serde", "rand", "rand-std"] }
 hex = "0.4.3"
 rand = "0.8.5"

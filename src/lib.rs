@@ -1,16 +1,17 @@
 use bitcoin::bip32::{DerivationPath, Xpriv};
+
+use bitcoin::opcodes::OP_FALSE;
+use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+use bitcoin::{key, TapLeafHash, XOnlyPublicKey};
 use core::str;
 use hex::FromHex;
 
 use std::str::FromStr;
 
-use bitcoin::hashes::Hash;
-use bitcoin::key::{Keypair, TapTweak, TweakedKeypair};
+use bitcoin::key::{Keypair, TapTweak, TweakedKeypair, UntweakedKeypair};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey, Signing, Verification};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
-use bitcoin::{
-    opcodes::all::*, opcodes::OP_0, Amount, Network, ScriptBuf, Transaction, TxOut, Witness,
-};
+use bitcoin::{opcodes::all::*, Amount, Network, ScriptBuf, Transaction, TxOut, Witness};
 
 pub fn get_mnemonic_keypair(
     seeds: &str,
@@ -65,50 +66,70 @@ pub fn taproot_schnorr_sign<C: Signing + Verification>(
     sk: &SecretKey,
     secp: &Secp256k1<C>,
 ) -> Transaction {
-    let keypair = Keypair::from_secret_key(secp, sk);
+    let keypair = UntweakedKeypair::from_secret_key(secp, sk);
+    let (pubkey, _) = XOnlyPublicKey::from_keypair(&keypair);
     let sighash_type = TapSighashType::Default;
     let prevouts = Prevouts::All(prevouts);
 
-    let input_index = 0;
-    let mut sighasher = SighashCache::new(tx);
-    let sighash = sighasher
-        .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
-        .expect("failed to construct sighash");
+    let script = sats_mint_script(&pubkey.serialize());
 
-    let tweaked: TweakedKeypair = keypair.tap_tweak(secp, None);
-    let msg = Message::from_digest(sighash.to_byte_array());
-    let signature = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_inner());
+    let taproot_spend_info = TaprootBuilder::new()
+        .add_leaf(0, script.clone())
+        .expect("adding leaf should work")
+        .finalize(secp, pubkey)
+        .expect("finalizeing taproot builder should work");
+
+    let control_block = taproot_spend_info
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .expect("should compute control block");
+
+    let input_index = 0;
+    let mut sighash_cache = SighashCache::new(tx);
+    // for taproot key-path spending
+    // let sighash = sighash_cache
+    //     .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_type)
+    //     .expect("failed to construct sighash");
+    let sighash = sighash_cache
+        .taproot_script_spend_signature_hash(
+            input_index,
+            &prevouts,
+            TapLeafHash::from_script(&script, LeafVersion::TapScript),
+            sighash_type,
+        )
+        .expect("signature hash should compute");
+
+    // let tweaked: TweakedKeypair = keypair.tap_tweak(secp, None);
+    let msg = Message::from_digest_slice(sighash.as_ref())
+        .expect("should be cryptographically secure hash");
+    // let sig = secp.sign_schnorr(&msg, &tweaked.to_inner());
+    let sig = secp.sign_schnorr(&msg, &keypair);
 
     let signature = bitcoin::taproot::Signature {
-        sig: signature,
+        sig,
         hash_ty: sighash_type,
     };
-    let sig_bytes = signature.to_vec();
-    // *sighasher.witness_mut(input_index).unwrap() = Witness::from_slice(&[&sig_bytes]);
-    let mut witness = Witness::new();
-    witness.push(sig_bytes);
 
-    let script = sats_mint_script();
-    let script = script.as_bytes();
+    // let mut witness = Witness::new();
+    let witness = sighash_cache
+        .witness_mut(input_index)
+        .expect("getting mutable witness reference should work");
+
+    witness.push(signature.to_vec());
     witness.push(script);
-    // TODO: another unknown 32-bytes with c0/c1 (OP_RETURN_192/OP_RETURN_193)
-    // witness.push(another_script);
-    eprintln!("{witness:#?}");
-    *sighasher.witness_mut(input_index).unwrap() = witness;
+    witness.push(&control_block.serialize());
 
-    // eprintln!("{:#?}", Witness::from_slice(&[sig_bytes]));
-    sighasher.into_transaction().to_owned()
+    // *sighash_cache.witness_mut(input_index).unwrap() = witness;
+
+    sighash_cache.into_transaction().to_owned()
 }
 
-pub fn sats_mint_script() -> ScriptBuf {
+pub fn sats_mint_script(pubkey: &[u8; 32]) -> ScriptBuf {
     let mut script = ScriptBuf::new();
 
-    script.push_opcode(OP_PUSHBYTES_32);
-    // TODO: determine what's the 32 bytes are, maybe the p2tr script pubkey
-    script.push_slice([]);
+    script.push_slice(pubkey);
     script.push_opcode(OP_CHECKSIG);
 
-    script.push_opcode(OP_0);
+    script.push_opcode(OP_FALSE);
     script.push_opcode(OP_IF);
 
     script.push_opcode(OP_PUSHBYTES_3);
@@ -121,7 +142,7 @@ pub fn sats_mint_script() -> ScriptBuf {
     script.push_slice(
         <[u8; 24]>::from_hex("746578742f706c61696e3b636861727365743d7574662d38").unwrap(),
     );
-    script.push_opcode(OP_0);
+    script.push_opcode(OP_FALSE);
 
     script.push_opcode(OP_PUSHBYTES_51);
     script.push_slice(<[u8; 51]>::from_hex("7b2270223a226272632d3230222c226f70223a226d696e74222c227469636b223a2273617473222c22616d74223a223130227d").unwrap());
